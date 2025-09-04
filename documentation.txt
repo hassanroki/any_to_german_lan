@@ -1,0 +1,276 @@
+1. composer create-project laravel/laravel laravel-translate-app
+cd laravel-translate-app
+
+composer require stichoza/google-translate-php smalot/pdfparser phpoffice/phpword barryvdh/laravel-dompdf
+
+
+2. php artisan make:model Translation -m
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('translations', function (Blueprint $table) {
+            $table->id();
+            $table->text('original_text');
+            $table->text('translated_text');
+            $table->string('chassi')->nullable();
+            $table->string('german_pdf')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('translations');
+    }
+};
+
+
+3. Edit Model
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Translation extends Model
+{
+    protected $fillable = ['original_text', 'translated_text', 'chassi', 'german_pdf'];
+}
+
+
+
+
+
+
+
+4. php artisan migrate
+
+5. Create controller and routes:
+php artisan make:controller TranslationController
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Support\Facades\Storage;
+use App\Models\Translation;
+use Illuminate\Http\Request;
+use Stichoza\GoogleTranslate\GoogleTranslate;
+use Barryvdh\DomPDF\Facade\Pdf;
+
+class TranslationController extends Controller
+{
+    public function index()
+    {
+        $translations = Translation::latest()->paginate(5);
+        return view('translate', compact('translations'));
+    }
+
+    public function translate(Request $request)
+    {
+        $request->validate([
+            'text' => 'nullable|string',
+            'chassi' => 'nullable|file|mimes:pdf,docx'
+        ]);
+
+        $originalText = $request->input('text');
+        $fileName = null;
+        $germanPdfName = null;
+
+        if ($request->hasFile('chassi')) {
+            $file = $request->file('chassi');
+            $fileName = time() . '_' . $file->getClientOriginalName();
+            $filePath = $file->storeAs('uploads', $fileName, 'public');
+
+            $ext = $file->getClientOriginalExtension();
+            if ($ext === 'pdf') {
+                $parser = new \Smalot\PdfParser\Parser();
+                $pdf = $parser->parseFile(storage_path('app/public/' . $filePath));
+                $originalText = $pdf->getText();
+            } elseif ($ext === 'docx') {
+                $phpWord = \PhpOffice\PhpWord\IOFactory::load(storage_path('app/public/' . $filePath));
+                $text = '';
+                foreach ($phpWord->getSections() as $section) {
+                    foreach ($section->getElements() as $element) {
+                        if (method_exists($element, 'getText')) {
+                            $text .= $element->getText() . "\n";
+                        }
+                    }
+                }
+                $originalText = $text;
+            }
+        }
+
+        if (!$originalText) {
+            return response()->json(['message' => 'No text found to translate.'], 400);
+        }
+
+        $tr = new GoogleTranslate('de');
+        $translatedText = $tr->translate($originalText);
+
+        $pdf = Pdf::loadView('german_pdf', ['translatedText' => $translatedText]);
+        $germanPdfName = 'german_' . time() . '.pdf';
+        Storage::disk('public')->put('generated/' . $germanPdfName, $pdf->output());
+
+        Translation::create([
+            'original_text' => $originalText,
+            'translated_text' => $translatedText,
+            'chassi' => $fileName,
+            'german_pdf' => $germanPdfName,
+        ]);
+
+        $translations = Translation::latest()->paginate(5);
+        $html = view('partials.translations', compact('translations'))->render();
+
+        return response()->json([
+            'message' => 'German PDF generated and saved!',
+            'html' => $html
+        ]);
+    }
+}
+
+
+
+6. <?php
+
+use App\Http\Controllers\TranslationController;
+use Illuminate\Support\Facades\Route;
+
+Route::get('/', [TranslationController::class, 'index']);
+Route::post('/translate', [TranslationController::class, 'translate'])->name('translate');
+
+
+
+
+7. resources/views/translate.blade.php:
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>English to German Translator</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css">
+    @vite(['resources/css/app.css','resources/js/app.js'])
+</head>
+<body class="bg-light">
+<div class="container mt-5">
+    <h1 class="mb-4 text-primary">📝 Translate English to German</h1>
+
+    <div class="card mb-5">
+        <div class="card-body">
+            <form id="translateForm" enctype="multipart/form-data">
+                @csrf
+                <div class="mb-3">
+                    <label for="text" class="form-label">Enter English Text:</label>
+                    <textarea name="text" id="text" rows="5" class="form-control" placeholder="Write something in English..."></textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="chassi" class="form-label">Or Upload a PDF/DOCX File:</label>
+                    <input type="file" name="chassi" id="chassi" class="form-control" accept=".pdf,.docx">
+                </div>
+                <button type="submit" class="btn btn-primary">Translate & Generate German PDF</button>
+            </form>
+        </div>
+    </div>
+
+    <h2 class="mb-3">📚 All Translations</h2>
+    <div id="translationsList">
+        @include('partials.translations', ['translations' => $translations])
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
+<script>
+document.getElementById("translateForm").addEventListener("submit", function(e) {
+    e.preventDefault();
+    let formData = new FormData(this);
+    axios.post("{{ route('translate') }}", formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+    })
+    .then(res => {
+        Toastify({ text: res.data.message, duration: 3000, gravity: "top", position: "right", backgroundColor: "green" }).showToast();
+        document.getElementById("translationsList").innerHTML = res.data.html;
+        document.getElementById("translateForm").reset();
+    })
+    .catch(err => {
+        Toastify({ text: err.response?.data?.message || "Something went wrong", duration: 3000, gravity: "top", position: "right", backgroundColor: "red" }).showToast();
+    });
+});
+</script>
+</body>
+</html>
+
+
+
+8. resources/views/partials/translations.blade.php:
+
+@if($translations->isEmpty())
+    <div class="alert alert-warning">No translations found yet.</div>
+@else
+    @foreach($translations as $key => $t)
+        <div class="card mb-4">
+            <div class="card-body">
+                <h5 class="card-title">Serial: {{ ($translations->currentPage() - 1) * $translations->perPage() + $loop->iteration }}</h5>
+
+                <p><strong>Original (English):</strong><br>{{ $t->original_text }}</p>
+                <p><strong>Translated (German):</strong><br>{{ $t->translated_text }}</p>
+
+                @if($t->chassi)
+                    <p><strong>Uploaded File:</strong>
+                        <a href="{{ asset('storage/uploads/' . $t->chassi) }}" target="_blank">
+                            {{ $t->chassi }}
+                        </a>
+                    </p>
+                @endif
+
+                @if($t->german_pdf)
+                    <p><strong>Download Translated German PDF:</strong>
+                        <a href="{{ asset('storage/generated/' . $t->german_pdf) }}" target="_blank" download>
+                            {{ $t->german_pdf }}
+                        </a>
+                    </p>
+                @endif
+
+                <small class="text-muted">Submitted at: {{ $t->created_at->format('d M Y, h:i A') }}</small>
+            </div>
+        </div>
+    @endforeach
+
+    <div class="d-flex justify-content-center">
+        {{ $translations->links('pagination::bootstrap-5') }}
+    </div>
+@endif
+
+
+
+
+
+9. resources/views/german_pdf.blade.php:
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>German Translation</title>
+    <style>
+        body { font-family: DejaVu Sans, sans-serif; font-size: 14px; line-height: 1.6; padding: 20px; }
+        h2 { text-align: center; color: #333; }
+        p { text-align: justify; }
+    </style>
+</head>
+<body>
+    <h2>Übersetzter Text (German Translation)</h2>
+    <p>{!! nl2br(e($translatedText)) !!}</p>
+</body>
+</html>
+
+
+10. Run dev servers
+php artisan serve
